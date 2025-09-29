@@ -29,8 +29,19 @@ class MOTNeuralSolver(pl.LightningModule):
     """
     def __init__(self, hparams):
         super().__init__()
-
-        self.hparams = hparams
+        # buffer for val-step outputs to replace validation_epoch_end(outputs)
+        self._val_step_outputs = []
+        # updating due to pytorch lightning change
+        # PL >= 1.0: hparams is a managed, read-only property.
+        # This stores your config under self.hparams so the rest of the code still works.
+        if isinstance(hparams, dict):
+            self.save_hyperparameters(hparams)
+        else:
+            # handle Namespace or other objects
+            try:
+                self.save_hyperparameters(vars(hparams))
+            except Exception:
+                self.save_hyperparameters({"hparams": hparams})
         self.model, self.cnn_model = self.load_model()
     
     def forward(self, x):
@@ -120,21 +131,44 @@ class MOTNeuralSolver(pl.LightningModule):
         log = {key + f'/{train_val}': val for key, val in logs.items()}
 
         if train_val == 'train':
-            return {'loss': loss, 'log': log}
+            # On PL 2.x, return the loss and log metrics explicitly
+            # Prefer logging over returning a 'log' dict
+            # (keeping return for compatibility with your trainer loop)
+            # Log the metrics for progress bar/epoch-level reduction if you want:
+            for k, v in log.items():
+                # reduce over epoch where it makes sense
+                self.log(k, v, on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+            return {'loss': loss}
 
         else:
-            return log
+            # stash for epoch-end aggregation
+            self._val_step_outputs.append(log)
+            # optionally also live-log step values (Lightning will reduce per-epoch)
+            for k, v in log.items():
+                self.log(k, v, on_step=False, on_epoch=True, prog_bar=(k.endswith('/val')), logger=True, sync_dist=False)
+            return log  # safe to return; PL ignores return value for val hooks
 
     def training_step(self, batch, batch_idx):
         return self._train_val_step(batch, batch_idx, 'train')
-
+ 
     def validation_step(self, batch, batch_idx):
         return self._train_val_step(batch, batch_idx, 'val')
 
-    def validation_epoch_end(self, outputs):
-        metrics = pd.DataFrame(outputs).mean(axis=0).to_dict()
-        metrics = {metric_name: torch.as_tensor(metric) for metric_name, metric in metrics.items()}
-        return {'val_loss': metrics['loss/val'], 'log': metrics}
+    def on_validation_epoch_end(self):
+        # aggregate the logs we saved during validation_step
+        if len(self._val_step_outputs) > 0:
+            metrics = pd.DataFrame(self._val_step_outputs).mean(axis=0).to_dict()
+            # convert to tensors for logging consistency
+            metrics = {name: torch.as_tensor(val) for name, val in metrics.items()}
+            # expose a scalar commonly used by callbacks/schedulers
+            if 'loss/val' in metrics:
+                self.log('val_loss', metrics['loss/val'], prog_bar=True, logger=True, sync_dist=False)
+            # also log the rest (Lightning handles epoch reduction already above,
+            # but we log here too in case callers consumed the old 'log' dict)
+            for k, v in metrics.items():
+                self.log(k, v, prog_bar=False, logger=True, sync_dist=False)
+        # clear buffer
+        self._val_step_outputs.clear()
 
     def track_all_seqs(self, output_files_dir, dataset, use_gt = False, verbose = False):
         tracker = MPNTracker(dataset=dataset,

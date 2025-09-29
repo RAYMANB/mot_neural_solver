@@ -101,27 +101,59 @@ class MOTMetricsLogger(Callback):
         return mot_metrics_summary
 
     def on_train_start(self, trainer, pl_module):
-        self.available_data = len(trainer.val_dataloaders) > 0 and len(trainer.val_dataloaders[0]) > 0
-        if self.available_data:
-            self.dataset = trainer.val_dataloaders[0].dataset
-            # Determine the path in which MOT results will be stored
+        # PL 2.x: val_dataloaders may be None here. Be defensive.
+        dls = getattr(trainer, "val_dataloaders", None)
+
+        def _has_batches(dl):
+            if dl is None:
+                return False
+            try:
+                return len(dl) > 0
+            except TypeError:
+                # Iterable/lengthless loader — assume it yields
+                return True
+
+        if dls is None:
+            self.available_data = False
+            first_dl = None
+        elif isinstance(dls, (list, tuple)):
+            self.available_data = any(_has_batches(dl) for dl in dls)
+            first_dl = dls[0] if dls else None
+        else:
+            self.available_data = _has_batches(dls)
+            first_dl = dls
+
+        if self.available_data and first_dl is not None:
+            self.dataset = getattr(first_dl, "dataset", None)
+
+            # Determine the path to store MOT results
             if trainer.logger is not None:
-                save_dir = osp.join(trainer.logger.save_dir, trainer.logger.name, trainer.logger.version )
-
+                # Prefer unified log_dir if available (e.g., TensorBoardLogger)
+                if hasattr(trainer.logger, "log_dir") and trainer.logger.log_dir:
+                    save_dir = trainer.logger.log_dir
+                elif all(hasattr(trainer.logger, a) for a in ("save_dir", "name", "version")):
+                    save_dir = osp.join(
+                        trainer.logger.save_dir,
+                        str(getattr(trainer.logger, "name", "") or ""),
+                        str(getattr(trainer.logger, "version", "")),
+                    )
+                else:
+                    save_dir = trainer.default_root_dir
             else:
-                save_dir = trainer.default_save_path
+                # default_save_path was removed in PL 2.x
+                save_dir = trainer.default_root_dir
 
-            self.output_files_dir = osp.join(save_dir, 'mot_files')
-            self.output_metrics_dir = osp.join(save_dir, 'mot_metrics')
+            self.output_files_dir = osp.join(save_dir, "mot_files")
+            self.output_metrics_dir = osp.join(save_dir, "mot_metrics")
             os.makedirs(self.output_metrics_dir, exist_ok=True)
 
-        # Compute oracle results if needed
-        if self.available_data and self.compute_oracle_results:
-            mot_metrics_summary = self._compute_mot_metrics(trainer.current_epoch, pl_module, oracle_results=True)
-            print(mot_metrics_summary)
-            oracle_path = osp.join(self.output_metrics_dir, 'oracle.npy')
-            save_pickle(mot_metrics_summary.to_dict(), oracle_path)
-            trainer.oracle_metrics = mot_metrics_summary
+            # Compute oracle results if needed
+            if self.available_data and self.compute_oracle_results:
+                mot_metrics_summary = self._compute_mot_metrics(trainer.current_epoch, pl_module, oracle_results=True)
+                print(mot_metrics_summary)
+                oracle_path = osp.join(self.output_metrics_dir, 'oracle.npy')
+                save_pickle(mot_metrics_summary.to_dict(), oracle_path)
+                trainer.oracle_metrics = mot_metrics_summary
 
     def on_epoch_end(self, trainer, pl_module):
         # Compute MOT metrics on validation data, save them and log them

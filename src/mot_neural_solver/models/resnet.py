@@ -467,28 +467,29 @@ def resnet50_fc256(num_classes, loss='xent', pretrained=True, **kwargs):
 
 
 def load_checkpoint(fpath):
-    r"""Loads checkpoint.
-
-    ``UnicodeDecodeError`` can be well handled, which means
-    python2-saved files can be read from python3.
-
-    Args:
-        fpath (str): path to checkpoint.
-
-    Returns:
-        dict
-
-
+    r"""Loads checkpoint safely across PyTorch versions.
+    
+    In PyTorch >= 2.6, torch.load defaults to weights_only=True.
+    Older checkpoints saved with pickle may fail under that mode.
+    This function tries the safe load first and falls back if needed.
     """
     if fpath is None:
         raise ValueError('File path is None')
     if not osp.exists(fpath):
-        raise FileNotFoundError('File is not found at "{}"'.format(fpath))
+        raise FileNotFoundError(f'File is not found at "{fpath}"')
+
     map_location = None if torch.cuda.is_available() else 'cpu'
 
-    checkpoint = torch.load(fpath, map_location=map_location)
-
-    return checkpoint
+    # ✅ First try safe loading (works with torch >= 2.6)
+    try:
+        return torch.load(fpath, map_location=map_location, weights_only=True)
+    except TypeError:
+        # Older torch that doesn’t support weights_only
+        return torch.load(fpath, map_location=map_location)
+    except Exception as e:
+        # ✅ If safe mode fails (e.g. UnpicklingError), fallback
+        print(f"[WARN] Safe loading failed ({e}). Falling back to classic unpickling...")
+        return torch.load(fpath, map_location=map_location, weights_only=False)
 
 def load_pretrained_weights(model, weight_path):
     r"""Loads pretrianed weights to model.

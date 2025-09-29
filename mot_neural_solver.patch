@@ -1,0 +1,259 @@
+diff --git a/scripts/train.py b/scripts/train.py
+index 6098749..7972ed2 100644
+--- a/scripts/train.py
++++ b/scripts/train.py
+@@ -9,6 +9,7 @@ import os.path as osp
+ 
+ from mot_neural_solver.pl_module.pl_module import MOTNeuralSolver
+ 
++import torch
+ from pytorch_lightning import Trainer
+ from pytorch_lightning.loggers import TensorBoardLogger
+ #from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
+@@ -66,16 +67,21 @@ def main(_config, _run):
+     ckpt_callback = ModelCheckpoint(save_epoch_start = _config['train_params']['save_epoch_start'],
+                                     save_every_epoch = _config['train_params']['save_every_epoch'])
+ 
+-    trainer = Trainer(gpus=1,
+-                      callbacks=[MOTMetricsLogger(compute_oracle_results = _config['eval_params']['normalize_mot_metrics']), ckpt_callback],
+-                      weights_summary = None,
+-                      checkpoint_callback=False,
+-                      max_epochs=_config['train_params']['num_epochs'],
+-                      val_percent_check = _config['eval_params']['val_percent_check'],
+-                      check_val_every_n_epoch=_config['eval_params']['check_val_every_n_epoch'],
+-                      nb_sanity_val_steps=0,
+-                      logger =logger,
+-                      default_save_path=osp.join(OUTPUT_PATH, 'experiments', run_str))
++    trainer = Trainer(
++        accelerator="gpu" if torch.cuda.is_available() else "cpu",
++        devices=1 if torch.cuda.is_available() else None,
++        callbacks=[
++            MOTMetricsLogger(compute_oracle_results=_config['eval_params']['normalize_mot_metrics']),
++            ckpt_callback,  # keep your custom checkpoint callback
++        ],
++        enable_checkpointing=False,
++        max_epochs=_config['train_params']['num_epochs'],
++        limit_val_batches=_config['eval_params']['val_percent_check'],
++        check_val_every_n_epoch=_config['eval_params']['check_val_every_n_epoch'],
++        num_sanity_val_steps=0,
++        logger=logger,
++        default_root_dir=osp.join(OUTPUT_PATH, 'experiments', run_str),
++    )
+     trainer.fit(model)
+ 
+ 
+diff --git a/src/mot_neural_solver/models/resnet.py b/src/mot_neural_solver/models/resnet.py
+index 1956fae..27d82c9 100644
+--- a/src/mot_neural_solver/models/resnet.py
++++ b/src/mot_neural_solver/models/resnet.py
+@@ -467,28 +467,29 @@ def resnet50_fc256(num_classes, loss='xent', pretrained=True, **kwargs):
+ 
+ 
+ def load_checkpoint(fpath):
+-    r"""Loads checkpoint.
+-
+-    ``UnicodeDecodeError`` can be well handled, which means
+-    python2-saved files can be read from python3.
+-
+-    Args:
+-        fpath (str): path to checkpoint.
+-
+-    Returns:
+-        dict
+-
+-
++    r"""Loads checkpoint safely across PyTorch versions.
++    
++    In PyTorch >= 2.6, torch.load defaults to weights_only=True.
++    Older checkpoints saved with pickle may fail under that mode.
++    This function tries the safe load first and falls back if needed.
+     """
+     if fpath is None:
+         raise ValueError('File path is None')
+     if not osp.exists(fpath):
+-        raise FileNotFoundError('File is not found at "{}"'.format(fpath))
+-    map_location = None if torch.cuda.is_available() else 'cpu'
++        raise FileNotFoundError(f'File is not found at "{fpath}"')
+ 
+-    checkpoint = torch.load(fpath, map_location=map_location)
++    map_location = None if torch.cuda.is_available() else 'cpu'
+ 
+-    return checkpoint
++    # ✅ First try safe loading (works with torch >= 2.6)
++    try:
++        return torch.load(fpath, map_location=map_location, weights_only=True)
++    except TypeError:
++        # Older torch that doesn’t support weights_only
++        return torch.load(fpath, map_location=map_location)
++    except Exception as e:
++        # ✅ If safe mode fails (e.g. UnpicklingError), fallback
++        print(f"[WARN] Safe loading failed ({e}). Falling back to classic unpickling...")
++        return torch.load(fpath, map_location=map_location, weights_only=False)
+ 
+ def load_pretrained_weights(model, weight_path):
+     r"""Loads pretrianed weights to model.
+diff --git a/src/mot_neural_solver/pl_module/pl_module.py b/src/mot_neural_solver/pl_module/pl_module.py
+index f2423a9..267c612 100644
+--- a/src/mot_neural_solver/pl_module/pl_module.py
++++ b/src/mot_neural_solver/pl_module/pl_module.py
+@@ -29,8 +29,19 @@ class MOTNeuralSolver(pl.LightningModule):
+     """
+     def __init__(self, hparams):
+         super().__init__()
+-
+-        self.hparams = hparams
++        # buffer for val-step outputs to replace validation_epoch_end(outputs)
++        self._val_step_outputs = []
++        # updating due to pytorch lightning change
++        # PL >= 1.0: hparams is a managed, read-only property.
++        # This stores your config under self.hparams so the rest of the code still works.
++        if isinstance(hparams, dict):
++            self.save_hyperparameters(hparams)
++        else:
++            # handle Namespace or other objects
++            try:
++                self.save_hyperparameters(vars(hparams))
++            except Exception:
++                self.save_hyperparameters({"hparams": hparams})
+         self.model, self.cnn_model = self.load_model()
+     
+     def forward(self, x):
+@@ -120,21 +131,44 @@ class MOTNeuralSolver(pl.LightningModule):
+         log = {key + f'/{train_val}': val for key, val in logs.items()}
+ 
+         if train_val == 'train':
+-            return {'loss': loss, 'log': log}
++            # On PL 2.x, return the loss and log metrics explicitly
++            # Prefer logging over returning a 'log' dict
++            # (keeping return for compatibility with your trainer loop)
++            # Log the metrics for progress bar/epoch-level reduction if you want:
++            for k, v in log.items():
++                # reduce over epoch where it makes sense
++                self.log(k, v, on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
++            return {'loss': loss}
+ 
+         else:
+-            return log
++            # stash for epoch-end aggregation
++            self._val_step_outputs.append(log)
++            # optionally also live-log step values (Lightning will reduce per-epoch)
++            for k, v in log.items():
++                self.log(k, v, on_step=False, on_epoch=True, prog_bar=(k.endswith('/val')), logger=True, sync_dist=False)
++            return log  # safe to return; PL ignores return value for val hooks
+ 
+     def training_step(self, batch, batch_idx):
+         return self._train_val_step(batch, batch_idx, 'train')
+-
++ 
+     def validation_step(self, batch, batch_idx):
+         return self._train_val_step(batch, batch_idx, 'val')
+ 
+-    def validation_epoch_end(self, outputs):
+-        metrics = pd.DataFrame(outputs).mean(axis=0).to_dict()
+-        metrics = {metric_name: torch.as_tensor(metric) for metric_name, metric in metrics.items()}
+-        return {'val_loss': metrics['loss/val'], 'log': metrics}
++    def on_validation_epoch_end(self):
++        # aggregate the logs we saved during validation_step
++        if len(self._val_step_outputs) > 0:
++            metrics = pd.DataFrame(self._val_step_outputs).mean(axis=0).to_dict()
++            # convert to tensors for logging consistency
++            metrics = {name: torch.as_tensor(val) for name, val in metrics.items()}
++            # expose a scalar commonly used by callbacks/schedulers
++            if 'loss/val' in metrics:
++                self.log('val_loss', metrics['loss/val'], prog_bar=True, logger=True, sync_dist=False)
++            # also log the rest (Lightning handles epoch reduction already above,
++            # but we log here too in case callers consumed the old 'log' dict)
++            for k, v in metrics.items():
++                self.log(k, v, prog_bar=False, logger=True, sync_dist=False)
++        # clear buffer
++        self._val_step_outputs.clear()
+ 
+     def track_all_seqs(self, output_files_dir, dataset, use_gt = False, verbose = False):
+         tracker = MPNTracker(dataset=dataset,
+diff --git a/src/mot_neural_solver/utils/evaluation.py b/src/mot_neural_solver/utils/evaluation.py
+index 696e8f4..bedd52e 100644
+--- a/src/mot_neural_solver/utils/evaluation.py
++++ b/src/mot_neural_solver/utils/evaluation.py
+@@ -101,27 +101,59 @@ class MOTMetricsLogger(Callback):
+         return mot_metrics_summary
+ 
+     def on_train_start(self, trainer, pl_module):
+-        self.available_data = len(trainer.val_dataloaders) > 0 and len(trainer.val_dataloaders[0]) > 0
+-        if self.available_data:
+-            self.dataset = trainer.val_dataloaders[0].dataset
+-            # Determine the path in which MOT results will be stored
++        # PL 2.x: val_dataloaders may be None here. Be defensive.
++        dls = getattr(trainer, "val_dataloaders", None)
++
++        def _has_batches(dl):
++            if dl is None:
++                return False
++            try:
++                return len(dl) > 0
++            except TypeError:
++                # Iterable/lengthless loader — assume it yields
++                return True
++
++        if dls is None:
++            self.available_data = False
++            first_dl = None
++        elif isinstance(dls, (list, tuple)):
++            self.available_data = any(_has_batches(dl) for dl in dls)
++            first_dl = dls[0] if dls else None
++        else:
++            self.available_data = _has_batches(dls)
++            first_dl = dls
++
++        if self.available_data and first_dl is not None:
++            self.dataset = getattr(first_dl, "dataset", None)
++
++            # Determine the path to store MOT results
+             if trainer.logger is not None:
+-                save_dir = osp.join(trainer.logger.save_dir, trainer.logger.name, trainer.logger.version )
+-
++                # Prefer unified log_dir if available (e.g., TensorBoardLogger)
++                if hasattr(trainer.logger, "log_dir") and trainer.logger.log_dir:
++                    save_dir = trainer.logger.log_dir
++                elif all(hasattr(trainer.logger, a) for a in ("save_dir", "name", "version")):
++                    save_dir = osp.join(
++                        trainer.logger.save_dir,
++                        str(getattr(trainer.logger, "name", "") or ""),
++                        str(getattr(trainer.logger, "version", "")),
++                    )
++                else:
++                    save_dir = trainer.default_root_dir
+             else:
+-                save_dir = trainer.default_save_path
++                # default_save_path was removed in PL 2.x
++                save_dir = trainer.default_root_dir
+ 
+-            self.output_files_dir = osp.join(save_dir, 'mot_files')
+-            self.output_metrics_dir = osp.join(save_dir, 'mot_metrics')
++            self.output_files_dir = osp.join(save_dir, "mot_files")
++            self.output_metrics_dir = osp.join(save_dir, "mot_metrics")
+             os.makedirs(self.output_metrics_dir, exist_ok=True)
+ 
+-        # Compute oracle results if needed
+-        if self.available_data and self.compute_oracle_results:
+-            mot_metrics_summary = self._compute_mot_metrics(trainer.current_epoch, pl_module, oracle_results=True)
+-            print(mot_metrics_summary)
+-            oracle_path = osp.join(self.output_metrics_dir, 'oracle.npy')
+-            save_pickle(mot_metrics_summary.to_dict(), oracle_path)
+-            trainer.oracle_metrics = mot_metrics_summary
++            # Compute oracle results if needed
++            if self.available_data and self.compute_oracle_results:
++                mot_metrics_summary = self._compute_mot_metrics(trainer.current_epoch, pl_module, oracle_results=True)
++                print(mot_metrics_summary)
++                oracle_path = osp.join(self.output_metrics_dir, 'oracle.npy')
++                save_pickle(mot_metrics_summary.to_dict(), oracle_path)
++                trainer.oracle_metrics = mot_metrics_summary
+ 
+     def on_epoch_end(self, trainer, pl_module):
+         # Compute MOT metrics on validation data, save them and log them
+diff --git a/tracking_wo_bnw b/tracking_wo_bnw
+index cdba418..a169156 160000
+--- a/tracking_wo_bnw
++++ b/tracking_wo_bnw
+@@ -1 +1 @@
+-Subproject commit cdba41835e8ff546a7ef9c32308ff4bc29b713c5
++Subproject commit a1691561213cd1e66e1fcb0b6296021d969025e1
