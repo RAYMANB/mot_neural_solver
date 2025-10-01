@@ -3,6 +3,7 @@ from sacred import Experiment
 
 from mot_neural_solver.utils.misc import make_deterministic, get_run_str_and_save_dir
 
+import torch, pytorch_lightning as pl, tempfile, os
 from mot_neural_solver.path_cfg import OUTPUT_PATH, DATA_PATH
 import os.path as osp
 
@@ -20,6 +21,29 @@ ex.add_config({'run_id': 'evaluation',
                'add_date': True,
                'precomputed_embeddings': True})
 
+def patch_ckpt(src_path: str) -> str:
+    """
+    Updates file metadata in order to ensure compatibility with newer pytorch version
+    """
+    ckpt = torch.load(src_path, map_location="cpu")
+
+    if isinstance(ckpt, dict) and "pytorch-lightning_version" in ckpt and "state_dict" in ckpt:
+        return src_path
+
+    if not isinstance(ckpt, dict):
+        ckpt = {"state_dict": ckpt}
+    elif "state_dict" not in ckpt:
+        ckpt = {"state_dict": ckpt}
+
+    ckpt.setdefault("pytorch-lightning_version", pl.__version__)
+    ckpt.setdefault("hyper_parameters", {})
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".ckpt")
+    os.close(fd)
+    torch.save(ckpt, tmp_path)
+    return tmp_path
+
+
 @ex.automain
 def main(_config, _run):
 
@@ -29,8 +53,11 @@ def main(_config, _run):
     run_str, save_dir = get_run_str_and_save_dir(_config['run_id'], None, _config['add_date'])
     out_files_dir = osp.join(save_dir, 'mot_files')
 
-    # Load model from checkpoint and update config entries that may vary from the ones used in training
-    model = MOTNeuralSolver.load_from_checkpoint(checkpoint_path=_config['ckpt_path'] if osp.exists(_config['ckpt_path'])  else osp.join(OUTPUT_PATH, _config['ckpt_path']))
+    ckpt_path = _config['ckpt_path'] if osp.exists(_config['ckpt_path']) else osp.join(OUTPUT_PATH, _config['ckpt_path'])
+    ckpt_path = patch_ckpt(ckpt_path)
+
+    model = MOTNeuralSolver.load_from_checkpoint(checkpoint_path=ckpt_path, hparams=_config)
+
     model.hparams.update({'eval_params':_config['eval_params'],
                           'data_splits':_config['data_splits']})
     model.hparams['dataset_params']['precomputed_embeddings'] = _config['precomputed_embeddings']
